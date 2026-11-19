@@ -10,6 +10,9 @@
     python3 metric_pools.py --min-tvl 50000 --sort apr7d --chain 1 --top 20
     python3 metric_pools.py --min-tvl 5000 --watch 300 --alert-apr 200
     python3 metric_pools.py --min-tvl 1000 --json > pools.json
+    # Telegram: разовая проверка (для cron / GitHub Actions)
+    TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... \
+        python3 metric_pools.py --min-tvl 10000 --alert-apr 300 --telegram --state alerts.json
 
 Только стандартная библиотека Python 3.8+.
 """
@@ -17,8 +20,10 @@
 import argparse
 import csv
 import json
+import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -174,6 +179,115 @@ def emit(rows, a):
         print_table(rows, a.sort)
 
 
+# ---------------------------------------------------------------- alerts ---
+
+def load_state(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(path, state):
+    if not path:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, path)
+
+
+def find_alerts(rows, a, state, now):
+    """Пулы, которые сейчас выше порога и о которых не сообщали последние --cooldown часов.
+
+    state = {"alerted": {address: unix_ts_последнего_уведомления}}.
+    Если пул опустился ниже порога, запись удаляется: при новом пересечении придёт новое уведомление
+    (но не раньше чем через --cooldown часов после предыдущего).
+    """
+    alerted = (state or {}).get("alerted", {})
+    hot = [p for p in rows if p[a.sort] is not None and p[a.sort] >= a.alert_apr]
+    hot_addr = {p["address"] for p in hot}
+    cooldown = a.cooldown * 3600
+    new = [p for p in hot if now - alerted.get(p["address"], 0) >= cooldown]
+    # забываем пулы, которые ушли ниже порога и чей кулдаун истёк
+    alerted = {k: v for k, v in alerted.items() if k in hot_addr or now - v < cooldown}
+    for p in new:
+        alerted[p["address"]] = now
+    return new, {"alerted": alerted, "updated": now}
+
+
+def html_escape(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def format_alert(p, sort_key):
+    tier = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(p["tier"], "⚪")
+    ver = "✅ " + html_escape(p["curator"] or "verified") if p["verified"] else "не verified"
+    flags = []
+    if p["allowlist"]:
+        flags.append("allowlist")
+    if p["status"] and p["status"] != "healthy":
+        flags.append("оракул: " + p["status"])
+    return (
+        f'{tier} <b><a href="{p["url"]}">{html_escape(p["pair"])}</a></b> · {html_escape(p["chain"])}\n'
+        f'APR 24ч <b>{pct(p["apr24h"])}</b> · 7д {pct(p["apr7d"])} · PnL 7д {pct(p["pnl7d"])}\n'
+        f'TVL {money(p["tvl"])} · объём 24ч {money(p["vol24h"])} · {ver}'
+        + (f'\n⚠️ {", ".join(flags)}' if flags else "")
+    )
+
+
+def telegram_send(text):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        raise RuntimeError("нужны переменные окружения TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID")
+    body = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
+                                   "disable_web_page_preview": "true"}).encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Telegram ответил {e.code}: {e.read().decode(errors='replace')[:300]}") from None
+
+
+def deliver(new, a):
+    if not new:
+        return
+    head = (f"🚀 {len(new)} {'пул' if len(new) == 1 else 'пулов'} с {a.sort} ≥ {a.alert_apr:g}% "
+            f"(TVL ≥ {money(a.min_tvl)})")
+    blocks = [format_alert(p, a.sort) for p in new]
+    if a.telegram:
+        # Telegram ограничивает сообщение 4096 символами — режем на части
+        msg = head
+        for b in blocks:
+            if len(msg) + len(b) + 2 > 3900:
+                telegram_send(msg)
+                msg = ""
+            msg += ("\n\n" if msg else "") + b
+        if msg:
+            telegram_send(msg)
+    if a.dry_run or not a.telegram:
+        print(head, file=sys.stderr)
+        for b in blocks:
+            print("\n" + b, file=sys.stderr)
+
+
+def run_alert_once(a):
+    rows = select(fetch_pools(a.chain), a)
+    now = int(time.time())
+    new, state = find_alerts(rows, a, load_state(a.state), now)
+    if a.dry_run:
+        a.telegram = False
+    deliver(new, a)
+    save_state(a.state, state)
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] пулов под фильтром: {len(rows)}, новых уведомлений: {len(new)}",
+          file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Монитор пулов app.metric.xyz по APR с фильтром TVL "
                                              "(включая неверифицированные пулы).")
@@ -193,14 +307,30 @@ def main():
     g.add_argument("--csv", action="store_true", help="вывод в CSV")
     ap.add_argument("--watch", type=int, metavar="SEC", help="режим мониторинга: обновлять каждые SEC секунд")
     ap.add_argument("--alert-apr", type=float, default=None,
-                    help="в режиме --watch: сообщать о новых пулах, где APR (--sort) >= этого значения")
+                    help="сообщать о пулах, где APR (по полю --sort) >= этого значения")
+    ap.add_argument("--telegram", action="store_true",
+                    help="слать уведомления в Telegram (env TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID); "
+                         "без --watch делает одну проверку и выходит")
+    ap.add_argument("--state", default="alerts-state.json",
+                    help="файл, где хранится, о каких пулах уже сообщали (по умолч. alerts-state.json)")
+    ap.add_argument("--cooldown", type=float, default=24,
+                    help="не повторять уведомление об одном пуле чаще, чем раз в N часов (по умолч. 24)")
+    ap.add_argument("--dry-run", action="store_true", help="печатать уведомления вместо отправки")
     a = ap.parse_args()
+    if a.top == 30 and (a.telegram or a.dry_run):
+        a.top = 0  # для уведомлений смотрим все пулы, а не только первые 30
+    if (a.telegram or a.dry_run) and a.alert_apr is None:
+        ap.error("для уведомлений укажи --alert-apr")
+    if a.telegram and not a.dry_run and not (os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")):
+        ap.error("для --telegram задай переменные окружения TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID")
 
     if not a.watch:
-        emit(select(fetch_pools(a.chain), a), a)
+        if a.telegram or a.dry_run:
+            run_alert_once(a)
+        else:
+            emit(select(fetch_pools(a.chain), a), a)
         return
 
-    seen = set()
     first = True
     while True:
         try:
@@ -214,14 +344,19 @@ def main():
             print(f"Обновлено {datetime.now():%Y-%m-%d %H:%M:%S}, min TVL {money(a.min_tvl)}\n")
         emit(rows, a)
         if a.alert_apr is not None:
-            hot = [p for p in rows if p[a.sort] is not None and p[a.sort] >= a.alert_apr]
-            new = [p for p in hot if p["address"] not in seen]
-            if new and not first:
+            new, st = find_alerts(rows, a, load_state(a.state), int(time.time()))
+            if first and not (a.telegram or a.dry_run):
+                new = []  # в терминале не шумим о том, что уже было на экране при старте
+            sent = True
+            if new:
                 print("\a", end="")
-                for p in new:
-                    print(f"\n>>> НОВЫЙ ПУЛ: {p['pair']} ({p['chain']}) {a.sort}={pct(p[a.sort])} "
-                          f"TVL={money(p['tvl'])} {p['url']}", file=sys.stderr)
-            seen.update(p["address"] for p in hot)
+                try:
+                    deliver(new, a)
+                except Exception as e:  # noqa: BLE001
+                    sent = False  # не запоминаем — попробуем отправить в следующий раз
+                    print(f"ошибка отправки: {e}", file=sys.stderr)
+            if sent:
+                save_state(a.state, st)
         first = False
         sys.stdout.flush()
         time.sleep(a.watch)
